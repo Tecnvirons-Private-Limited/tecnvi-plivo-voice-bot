@@ -1,0 +1,16 @@
+openai
+quart
+werkzeug
+Flask
+python-dotenv
+plivo
+websockets
+requests
+psycopg2-binary
+google-generativeai
+pinecone
+pandas
+openpyxl
+python-dateutil
+pytz
+realtime
