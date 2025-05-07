@@ -54,6 +54,7 @@ app = Quart(__name__)
 def home():
     xml_data = f'''<?xml version="1.0" encoding="UTF-8"?>
     <Response>
+        <Speak voice="Polly.Amy">Welcome to our Smart Product Assistant! Please ask anything you want to know about our products or any other questions you may have.</Speak>
         <Stream streamTimeout="86400" keepCallAlive="true" bidirectional="true" contentType="audio/x-mulaw;rate=8000" audioTrack="inbound" >
             ws://{request.host}/media-stream
         </Stream>
