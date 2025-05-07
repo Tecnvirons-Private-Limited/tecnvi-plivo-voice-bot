@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 # Environment variables and constants
-PORT = 5000
+PORT = int(os.getenv("PORT", 5000))
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
