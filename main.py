@@ -287,4 +287,4 @@ if __name__ == "__main__":
     #     answer_url=os.getenv('PLIVO_ANSWER_XML'),
     #     answer_method='GET',)
     
-    app.run(port=PORT)
+    app.run(host="0.0.0.0", port=PORT)
