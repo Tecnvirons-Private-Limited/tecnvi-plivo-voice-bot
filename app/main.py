@@ -10,7 +10,9 @@ import google.generativeai as genai
 from pinecone import Pinecone
 from dotenv import load_dotenv
 import time
-
+from realtime_tools import search_product_database
+from number import extract_mobile_numbers
+from tools import send_simple_whatsapp, generate_inquiry_invoice
 # Load environment variables
 load_dotenv(dotenv_path='.env', override=True)
 
@@ -25,7 +27,6 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
 DEFAULT_NAMESPACE = "Tec Nviirons Sample data testing.xlsx 2025-05-02 09:05:24"
-INDEX_NAME = "voice-bot-gemini-embedding-004-index"
 
 # Configure APIs
 if not OPENAI_API_KEY:
@@ -33,45 +34,71 @@ if not OPENAI_API_KEY:
 
 genai.configure(api_key=GENAI_API_KEY)
 
-# Set up Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY)
-try:
-    index = pc.Index(INDEX_NAME)
-    logger.info(f"Connected to Pinecone index: {INDEX_NAME}")
-except Exception as e:
-    logger.error(f"Pinecone setup error: {e}")
-    raise
-
 # System prompt for the assistant
 SYSTEM_MESSAGE = (
     "You are a helpful assistant who can answer product-related questions using a product database. "
     "If the user asks about a product, you'll search the database to provide accurate information. "
     "For other topics, you'll be friendly and conversational."
-    ""
 )
 
 app = Quart(__name__)
 
-# Store for transcriptions and function calls
-transcriptions = {}
-function_calls = []  # New list to store function call data
+# Store call data separately for each call UUID
+call_data = {}
 
 @app.route("/webhook", methods=["GET", "POST"])
-def home():
+async def home():
+    # Extract caller information
+    values = await request.values
+    caller_number = values.get('From', 'unknown')
+    called_number = values.get('To', 'unknown')
+    call_uuid = values.get('CallUUID', 'unknown')
+    
+    # Log the incoming call
+    print(f"Incoming call from {caller_number} to {called_number} (UUID: {call_uuid})")
+    
+    # Initialize data structures for this call
+    call_data[call_uuid] = {
+        'caller_number': caller_number,
+        'called_number': called_number,
+        'timestamp': time.time(),
+        'transcriptions': {},
+        'function_calls': []
+    }
+    
     xml_data = f'''<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Stream streamTimeout="86400" keepCallAlive="true" bidirectional="true" contentType="audio/x-mulaw;rate=8000" audioTrack="inbound" >
-            ws://{request.host}/media-stream
+            ws://{request.host}/media-stream/{call_uuid}
         </Stream>
     </Response>
     '''
     return Response(xml_data, mimetype='application/xml')
 
 
-@app.websocket('/media-stream')
-async def handle_message():
-    print('client connected')
+@app.websocket('/media-stream/<call_uuid>')
+async def handle_message(call_uuid):
+    print(f'Client connected for call UUID: {call_uuid}')
     plivo_ws = websocket 
+    
+    # Ensure we have data for this call
+    if call_uuid not in call_data:
+        print(f"Warning: No call data found for UUID {call_uuid}, creating empty data")
+        call_data[call_uuid] = {
+            'caller_number': 'unknown',
+            'called_number': 'unknown',
+            'timestamp': time.time(),
+            'transcriptions': {},
+            'function_calls': []
+        }
+    
+    caller_number = call_data[call_uuid]['caller_number']
+    print(f"Processing call from: {caller_number} with UUID: {call_uuid}")
+    
+    # Pass call info to the WebSocket session
+    plivo_ws.caller_number = caller_number
+    plivo_ws.call_uuid = call_uuid
+
     url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -80,28 +107,28 @@ async def handle_message():
 
     try: 
         async with websockets.connect(url, extra_headers=headers) as openai_ws:
-            print('connected to the OpenAI Realtime API')
+            print(f'Connected to the OpenAI Realtime API for call {call_uuid}')
 
             await send_session_update(openai_ws)
             
-            receive_task = asyncio.create_task(receive_from_plivo(plivo_ws, openai_ws))
+            receive_task = asyncio.create_task(receive_from_plivo(plivo_ws, openai_ws, call_uuid))
             
             async for message in openai_ws:
-                await receive_from_openai(message, plivo_ws, openai_ws)
+                await receive_from_openai(message, plivo_ws, openai_ws, call_uuid)
             
             await receive_task
     
     except asyncio.CancelledError:
-        print('client disconnected')
-        print_transcriptions()
+        print(f'Client disconnected for call {call_uuid}')
+        await after_call_hangup(call_uuid)
     except websockets.ConnectionClosed:
-        print("Connection closed by OpenAI server")
-        print_transcriptions()
+        print(f"Connection closed by OpenAI server for call {call_uuid}")
+        await after_call_hangup(call_uuid)
     except Exception as e:
-        print(f"Error during OpenAI's websocket communication: {e}")
-        print_transcriptions()
+        print(f"Error during OpenAI's websocket communication for call {call_uuid}: {e}")
+        await after_call_hangup(call_uuid)
         
-async def receive_from_plivo(plivo_ws, openai_ws):
+async def receive_from_plivo(plivo_ws, openai_ws, call_uuid):
     try:
         while True:
             message = await plivo_ws.receive()
@@ -113,32 +140,32 @@ async def receive_from_plivo(plivo_ws, openai_ws):
                 }
                 await openai_ws.send(json.dumps(audio_append))
             elif data['event'] == "start":
-                print('Plivo Audio stream has started')
+                print(f'Plivo Audio stream has started for call {call_uuid}')
                 plivo_ws.stream_id = data['start']['streamId']
             elif data['event'] == "hangup":
-                print('Call has ended')
-                print_transcriptions()
+                print(f'Call has ended for call {call_uuid}')
+                await after_call_hangup(call_uuid)
                 if openai_ws.open:
                     await openai_ws.close()
 
     except websockets.ConnectionClosed:
-        print('Connection closed for the plivo audio streaming servers')
-        print_transcriptions()
+        print(f'Connection closed for the plivo audio streaming servers for call {call_uuid}')
+        await after_call_hangup(call_uuid)
         if openai_ws.open:
             await openai_ws.close()
     except Exception as e:
-        print(f"Error during Plivo's websocket communication: {e}")
-        print_transcriptions()
+        print(f"Error during Plivo's websocket communication for call {call_uuid}: {e}")
+        await after_call_hangup(call_uuid)
 
-async def receive_from_openai(message, plivo_ws, openai_ws):
+async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
     try:
         response = json.loads(message)
-        print('response received from OpenAI Realtime API: ', response['type'])
+        print(f'Response received from OpenAI Realtime API for call {call_uuid}: {response["type"]}')
         
         if response['type'] == 'session.updated':
-           print('session updated successfully')
+           print(f'Session updated successfully for call {call_uuid}')
         elif response['type'] == 'error':
-            print('error received from realtime api: ', response)
+            print(f'Error received from realtime api for call {call_uuid}: {response}')
         elif response['type'] == 'response.audio.delta':
             audio_delta = {
                "event": "playAudio",
@@ -150,7 +177,7 @@ async def receive_from_openai(message, plivo_ws, openai_ws):
             }
             await plivo_ws.send(json.dumps(audio_delta))
         elif response['type'] == 'response.function_call_arguments.done':
-            print('received function call response ', response)
+            print(f'Received function call response for call {call_uuid}: {response}')
             if response['name'] == 'search_product_database':
                 # Call the RAG function with the query
                 args = json.loads(response['arguments'])
@@ -158,12 +185,13 @@ async def receive_from_openai(message, plivo_ws, openai_ws):
                 result = await search_product_database(args['query'])
                 
                 # Record the function call and its result
-                function_calls.append({
-                    'timestamp': time.time(),
-                    'query': query,
-                    'result': result,
-                    'item_id': response['item_id']
-                })
+                if call_uuid in call_data:
+                    call_data[call_uuid]['function_calls'].append({
+                        'timestamp': time.time(),
+                        'query': query,
+                        'result': result,
+                        'item_id': response['item_id']
+                    })
                 
                 # Send the RAG function output back to OpenAI
                 output = function_call_output(result, response['item_id'], response['call_id'])
@@ -178,30 +206,32 @@ async def receive_from_openai(message, plivo_ws, openai_ws):
                         "instructions": 'Share the product information from the database search with the user in a helpful way.'
                     }
                 }
-                print("sending RAG search result response")
+                print(f"Sending RAG search result response for call {call_uuid}")
                 await openai_ws.send(json.dumps(generate_response))
         # Handle transcription delta events
         elif response['type'] == 'conversation.item.input_audio_transcription.delta':
             item_id = response.get('item_id')
             delta = response.get('delta', '')
             
-            if item_id not in transcriptions:
-                transcriptions[item_id] = {'text': delta, 'complete': False}
-            else:
-                transcriptions[item_id]['text'] += delta
+            if call_uuid in call_data:
+                if item_id not in call_data[call_uuid]['transcriptions']:
+                    call_data[call_uuid]['transcriptions'][item_id] = {'text': delta, 'complete': False}
+                else:
+                    call_data[call_uuid]['transcriptions'][item_id]['text'] += delta
             
-            print(f"Transcription delta for {item_id}: {delta}")
+            print(f"Transcription delta for call {call_uuid}, item {item_id}: {delta}")
             
         # Handle transcription completed events
         elif response['type'] == 'conversation.item.input_audio_transcription.completed':
             item_id = response.get('item_id')
             full_transcript = response.get('transcript', '')
             
-            transcriptions[item_id] = {'text': full_transcript, 'complete': True}
-            print(f"Transcription completed for {item_id}: {full_transcript}")
+            if call_uuid in call_data:
+                call_data[call_uuid]['transcriptions'][item_id] = {'text': full_transcript, 'complete': True}
+            print(f"Transcription completed for call {call_uuid}, item {item_id}: {full_transcript}")
                 
         elif response['type'] == 'input_audio_buffer.speech_started':
-            print('speech is started')
+            print(f'Speech started for call {call_uuid}')
             clear_audio_data = {
                 "event": "clearAudio",
                 "stream_id": plivo_ws.stream_id
@@ -212,7 +242,7 @@ async def receive_from_openai(message, plivo_ws, openai_ws):
             }
             await openai_ws.send(json.dumps(cancel_response))
     except Exception as e:
-        print(f"Error during OpenAI's websocket communication: {e}")
+        print(f"Error during OpenAI's websocket communication for call {call_uuid}: {e}")
     
 async def send_session_update(openai_ws):
     session_update = {
@@ -263,13 +293,25 @@ def function_call_output(result, item_id, call_id):
     }
     return conversation_item
 
-def print_transcriptions():
-    """Print user transcriptions and function call data in chronological order"""
-    if not transcriptions and not function_calls:
-        print("No transcriptions or function calls recorded for this call.")
+async def after_call_hangup(call_uuid):
+    """Process transcriptions, generate invoice, and send via WhatsApp for a specific call"""
+    # Check if we have data for this call
+    if call_uuid not in call_data:
+        print(f"No call data found for UUID {call_uuid}")
         return
         
-    print("\n====== CALL TRANSCRIPT & FUNCTION CALLS ======")
+    call_info = call_data[call_uuid]
+    transcriptions = call_info['transcriptions']
+    function_calls = call_info['function_calls']
+    
+    if not transcriptions and not function_calls:
+        print(f"No transcriptions or function calls recorded for call {call_uuid}")
+        # Clean up call data
+        if call_uuid in call_data:
+            del call_data[call_uuid]
+        return
+        
+    print(f"\n====== CALL {call_uuid} TRANSCRIPT & FUNCTION CALLS ======")
     
     # Prepare both transcriptions and function calls with timestamps
     conversation_events = []
@@ -277,10 +319,9 @@ def print_transcriptions():
     # Add user transcriptions
     sorted_items = sorted(transcriptions.items(), key=lambda x: x[0])
     for i, (item_id, data) in enumerate(sorted_items):
-        # Use item index as a rough timestamp since we don't have real timestamps for transcriptions
         conversation_events.append({
             'type': 'transcript',
-            'order': i,  # Use as a sorting key
+            'order': i,
             'item_id': item_id,
             'text': data['text']
         })
@@ -289,13 +330,13 @@ def print_transcriptions():
     for i, call in enumerate(function_calls):
         conversation_events.append({
             'type': 'function_call',
-            'order': len(sorted_items) + i,  # Place after transcriptions 
+            'order': len(sorted_items) + i,
             'item_id': call['item_id'],
             'query': call['query'],
             'result': call['result']
         })
     
-    # Sort all events by our order field (which preserves sequence)
+    # Sort all events by our order field
     conversation_events.sort(key=lambda x: x['order'])
     
     # Print all events in order
@@ -308,91 +349,43 @@ def print_transcriptions():
     
     print("============================================\n")
     
-    # Save to file with timestamp
-    filename = f"call_transcript_{int(time.time())}.txt"
-    with open(filename, "w") as f:
-        f.write("CALL TRANSCRIPT & DATABASE QUERIES\n")
-        f.write("=================================\n\n")
-        
-        for event in conversation_events:
-            if event['type'] == 'transcript':
-                f.write(f"User: {event['text']}\n")
-            else:
-                f.write(f"\nDATABASE QUERY: {event['query']}\n")
-                f.write(f"RESULT: {event['result']}\n\n")
-                
-    print(f"Transcript saved to {filename}")
-
-# RAG search function from example.py
-async def search_product_database(query, namespace=DEFAULT_NAMESPACE):
-    """Search product information in vector database"""
+    # Format transcript data as string
+    transcript_text = "CALL TRANSCRIPT & DATABASE QUERIES\n"
+    transcript_text += "=================================\n\n"
+    
+    for event in conversation_events:
+        if event['type'] == 'transcript':
+            transcript_text += f"User: {event['text']}\n"
+        else:
+            transcript_text += f"\nDATABASE QUERY: {event['query']}\n"
+            transcript_text += f"RESULT: {event['result']}\n\n"
+    
+    # Get the caller number from call data
+    caller_number_raw = call_info.get('caller_number', 'unknown')
+    
+    # Extract valid mobile number using extract_mobile_numbers function
+    valid_numbers = extract_mobile_numbers(caller_number_raw, country="NP")
+    recipient_number = valid_numbers[0] if valid_numbers else caller_number_raw
+    print(f"Extracted recipient number for call {call_uuid}: {recipient_number}")
+    
+    # Generate invoice from transcript data
+    invoice = generate_inquiry_invoice(transcript_text)
+    print(f"Generated invoice summary for call {call_uuid}:")
+    print(invoice)
+    
+    # Send WhatsApp message with the invoice
     try:
-        # Logs the query and namespace so developers can see what's being searched.
-        logger.info(f"Searching for: '{query}' in namespace '{namespace}'")
-        embed_response = genai.embed_content(
-            model="models/text-embedding-004", 
-            content=query
-        )
-        embedding = embed_response["embedding"]
-        results = index.query(
-            vector=embedding,
-            namespace=namespace,
-            top_k=8,
-            include_metadata=True
-        )
-        print(f"Search results: {results}")        
-        if not results["matches"]:
-            return "I couldn't find information about that product in our database."
-        
-        contexts = []
-        for match in results["matches"]:
-            if "text" in match.get("metadata", {}):
-                contexts.append(match["metadata"]["text"])
-                
-        if not contexts:
-            return "I found some matches but they don't contain usable information."
-        
-        context_text = "\n---\n".join(contexts)
-        summary_prompt = f"""
-        Based on these product details:
-        {context_text}
-
-        Extract the product information from any "Unnamed" labels, then respond in a natural, conversational tone as if you're speaking to someone. Include:
-        - The product name (from the first "Unnamed" field)
-        - The quantity (the number after a date range)(THis always remains positive even if the context shows negative)
-        - The unit price
-        - The total cost
-
-        For example, if you see:
-        "Unnamed: 0: BOLT ALLEN M6X10LX1P RH SS 202
-        1-Apr-24 to 1-Mar-25: 100
-        Unnamed: 2: 9.86
-        Unnamed: 3: 985.64"
-
-        Respond conversationally like:
-        "I found that BOLT ALLEN M6X10LX1P RH SS is available. I have 100 units at $9.86 each,in stock?"
-        "If nothing is available, respond like: I found that BOLT ALLEN M6X10LX1P RH SS is not available at the moment."
-
-        Maintain a helpful, friendly tone and address the user's question: {query}
-        If the question asks for specific information, focus on that part in your response.
-        """
-
-        summary = genai.GenerativeModel("gemini-1.5-flash").generate_content(summary_prompt)
-        return summary.text
-
+        send_simple_whatsapp(recipient_number, invoice)
+        print(f"WhatsApp invoice sent successfully to {recipient_number} for call {call_uuid}")
     except Exception as e:
-        logger.error(f"Vector search error: {e}")
-        return f"Sorry, I encountered an error searching our product database."
+        print(f"Failed to send WhatsApp message for call {call_uuid}: {e}")
+    
+    # Clean up call data
+    if call_uuid in call_data:
+        print(f"Cleaning up data for call {call_uuid}")
+        del call_data[call_uuid]
+
 
 if __name__ == "__main__":
     print('running the server')
-    # client = plivo.RestClient(auth_id=os.getenv('PLIVO_AUTH_ID'), auth_token=os.getenv('PLIVO_AUTH_TOKEN'))
-
-    # # Make an outbound call
-    # call_made = client.calls.create(
-    #     from_=os.getenv('PLIVO_FROM_NUMBER'),
-    #     to_=os.getenv('PLIVO_TO_NUMBER'),
-    #     answer_url=os.getenv('PLIVO_ANSWER_XML'),
-    #     answer_method='GET',)
-    
     app.run(port=PORT)
