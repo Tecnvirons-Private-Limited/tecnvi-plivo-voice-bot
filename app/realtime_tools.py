@@ -38,7 +38,7 @@ async def search_product_database(query, namespace=os.getenv("DEFAULT_NAMESPACE"
         results = index.query(
             vector=embedding,
             namespace=namespace,
-            top_k=8,
+            top_k=3,
             include_metadata=True
         )
         print(f"Search results: {results}")        
@@ -71,10 +71,12 @@ async def search_product_database(query, namespace=os.getenv("DEFAULT_NAMESPACE"
         Unnamed: 3: 985.64"
 
         Respond conversationally like:
-        "I found that BOLT ALLEN M6X10LX1P RH SS is available. You can get 100 units at $9.86 each, with a total cost of $985.64. Is there anything specific about this product you'd like to know?"
+        "I found that BOLT ALLEN M6X10LX1P RH SS is available. You can get 100 units at ₹9.86 each, with a total cost of ₹985.64. Is there anything specific about this product you'd like to know?"
 
         Maintain a helpful, friendly tone and address the user's question: {query}
         If the question asks for specific information, focus on that part in your response.
+        Note: IF the product number is negative or any NAN values just say it is out of stock.
+        Also the currency is in INR.
         """
 
         summary = genai.GenerativeModel("gemini-1.5-flash").generate_content(summary_prompt)

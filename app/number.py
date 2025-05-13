@@ -5,12 +5,12 @@ from phonenumbers import PhoneNumberType, NumberParseException
 # Change the country code to your desired country
 # For example, for Nepal, use "NP"
 # For India, use "IN"
-def extract_mobile_numbers(raw, country = "NP"):
+def extract_mobile_numbers(raw, country ):
     valid_mobiles = []
     for i in range(len(raw)):
         for j in range(i+8, min(i+16, len(raw)+1)):
             try:
-                number = phonenumbers.parse(raw[i:j], "NP")
+                number = phonenumbers.parse(raw[i:j], country)
                 if (
                     phonenumbers.is_valid_number(number) and
                     phonenumbers.region_code_for_number(number) == country and
@@ -21,6 +21,4 @@ def extract_mobile_numbers(raw, country = "NP"):
                     valid_mobiles.append(formatted)
             except NumberParseException:
                 continue
-    return list(set(valid_mobiles))  # Ensure uniqueness
-
-# Run it
+    return list(set(valid_mobiles))
